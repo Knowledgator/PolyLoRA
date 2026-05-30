@@ -1,0 +1,13 @@
+torch>=2.1.0
+triton>=3.0.0
+
+[dev]
+pytest
+peft
+safetensors
+transformers>=4.30.0
+
+[peft]
+peft
+safetensors
+transformers>=4.30.0
