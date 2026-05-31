@@ -36,32 +36,28 @@ class MultiLoraLinear(nn.Module):
         if lora_ctx is None:
             return base
 
-        if x.shape[0] != lora_ctx.weight_indices.shape[0]:
-            raise ValueError("LoRA batch context batch size does not match layer input batch size")
-
         original_shape = base.shape
-        x_3d = self._as_3d(x).contiguous()
-        base_3d = self._as_3d(base).contiguous()
+        x_3d, base_3d, seq_lens, weight_indices = self._prepare_batched_inputs(x, base, lora_ctx)
 
         if self._can_use_triton(x_3d):
             tmp = _SGMV_LORA_A_FWD(
                 x_3d,
                 self.cache.A[self.module_name],
-                lora_ctx.seq_lens,
-                lora_ctx.weight_indices,
-                self.cache.ranks,
+                seq_lens,
+                weight_indices,
+                self.cache.ranks[self.module_name],
             )
             out = _SGMV_LORA_B_FWD(
                 tmp,
                 self.cache.B[self.module_name],
-                lora_ctx.seq_lens,
-                lora_ctx.weight_indices,
-                self.cache.ranks,
-                self.cache.scales,
+                seq_lens,
+                weight_indices,
+                self.cache.ranks[self.module_name],
+                self.cache.scales[self.module_name],
                 base_3d,
             )
         else:
-            out = self._reference_forward(x_3d, base_3d, lora_ctx.seq_lens, lora_ctx.weight_indices)
+            out = self._reference_forward(x_3d, base_3d, seq_lens, weight_indices)
 
         return out.reshape(original_shape)
 
@@ -83,6 +79,36 @@ class MultiLoraLinear(nn.Module):
             return x.reshape(x.shape[0], -1, x.shape[-1])
         raise ValueError("MultiLoraLinear expects a batched tensor")
 
+    def _prepare_batched_inputs(self, x, base, lora_ctx):
+        if x.shape[0] == lora_ctx.weight_indices.shape[0]:
+            return (
+                self._as_3d(x).contiguous(),
+                self._as_3d(base).contiguous(),
+                lora_ctx.seq_lens,
+                lora_ctx.weight_indices,
+            )
+
+        if x.dim() == 3 and x.shape[0] == 1:
+            return (
+                x.contiguous(),
+                base.contiguous(),
+                torch.clamp(lora_ctx.seq_lens[:1], max=x.shape[1]),
+                lora_ctx.weight_indices[:1],
+            )
+
+        if x.dim() == 2 and x.shape[0] % lora_ctx.weight_indices.shape[0] == 0:
+            batch_size = lora_ctx.weight_indices.shape[0]
+            seq_len = x.shape[0] // batch_size
+            seq_lens = torch.clamp(lora_ctx.seq_lens, max=seq_len)
+            return (
+                x.reshape(batch_size, seq_len, x.shape[-1]).contiguous(),
+                base.reshape(batch_size, seq_len, base.shape[-1]).contiguous(),
+                seq_lens,
+                lora_ctx.weight_indices,
+            )
+
+        raise ValueError("LoRA batch context batch size does not match layer input batch size")
+
     def _reference_forward(
         self,
         x: torch.Tensor,
@@ -93,8 +119,8 @@ class MultiLoraLinear(nn.Module):
         out = base.clone()
         A = self.cache.A[self.module_name]
         B = self.cache.B[self.module_name]
-        ranks = self.cache.ranks
-        scales = self.cache.scales
+        ranks = self.cache.ranks[self.module_name]
+        scales = self.cache.scales[self.module_name]
         seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
         slots_cpu = weight_indices.detach().to("cpu").tolist()
 

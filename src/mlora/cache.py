@@ -36,6 +36,8 @@ class GpuAdapterCache:
 
         self.A: dict[str, torch.Tensor] = {}
         self.B: dict[str, torch.Tensor] = {}
+        self.ranks: dict[str, torch.Tensor] = {}
+        self.scales: dict[str, torch.Tensor] = {}
         self.module_specs = {spec.name: spec for spec in module_specs}
         for spec in module_specs:
             self.A[spec.name] = torch.zeros(
@@ -52,8 +54,8 @@ class GpuAdapterCache:
                 device=self.device,
                 dtype=self.dtype,
             )
-        self.ranks = torch.zeros(self.num_slots, device=self.device, dtype=torch.int32)
-        self.scales = torch.zeros(self.num_slots, device=self.device, dtype=torch.float32)
+            self.ranks[spec.name] = torch.zeros(self.num_slots, device=self.device, dtype=torch.int32)
+            self.scales[spec.name] = torch.zeros(self.num_slots, device=self.device, dtype=torch.float32)
 
     def ensure_resident(self, adapter_ids: list[str]) -> torch.Tensor:
         needed = {adapter_id for adapter_id in adapter_ids if adapter_id != self.config.base_adapter_id}
@@ -89,8 +91,8 @@ class GpuAdapterCache:
         self.dtype = dtype
         self.A = {name: tensor.to(device=device, dtype=dtype) for name, tensor in self.A.items()}
         self.B = {name: tensor.to(device=device, dtype=dtype) for name, tensor in self.B.items()}
-        self.ranks = self.ranks.to(device=device)
-        self.scales = self.scales.to(device=device)
+        self.ranks = {name: tensor.to(device=device) for name, tensor in self.ranks.items()}
+        self.scales = {name: tensor.to(device=device) for name, tensor in self.scales.items()}
 
     def _allocate_or_evict(self, needed: set[str]) -> int:
         for slot in range(1, self.num_slots):
@@ -103,24 +105,27 @@ class GpuAdapterCache:
             slot = self.adapter_to_slot.pop(adapter_id)
             self.lru.pop(adapter_id, None)
             self.slot_to_adapter[slot] = None
-            self.ranks[slot].zero_()
-            self.scales[slot].zero_()
             for tensor in self.A.values():
                 tensor[slot].zero_()
             for tensor in self.B.values():
+                tensor[slot].zero_()
+            for tensor in self.ranks.values():
+                tensor[slot].zero_()
+            for tensor in self.scales.values():
                 tensor[slot].zero_()
             return slot
         raise RuntimeError("No evictable LoRA adapter slot is available")
 
     def _load_adapter_into_slot(self, adapter_id: str, slot: int) -> None:
         adapter = self.store.get(adapter_id)
-        rank: int | None = None
-        scale: float | None = None
         for module_name, spec in self.module_specs.items():
-            try:
-                weights = adapter.layers[module_name]
-            except KeyError as exc:
-                raise ValueError(f"Adapter {adapter_id!r} is missing weights for {module_name!r}") from exc
+            weights = adapter.layers.get(module_name)
+            self.A[module_name][slot].zero_()
+            self.B[module_name][slot].zero_()
+            self.ranks[module_name][slot].zero_()
+            self.scales[module_name][slot].zero_()
+            if weights is None:
+                continue
             if weights.rank > self.config.max_rank:
                 raise ValueError(
                     f"Adapter {adapter_id!r} rank {weights.rank} exceeds max_rank {self.config.max_rank}"
@@ -129,23 +134,16 @@ class GpuAdapterCache:
                 raise ValueError(f"LoRA A shape mismatch for adapter {adapter_id!r}, module {module_name!r}")
             if weights.B.shape != (weights.rank, spec.out_features):
                 raise ValueError(f"LoRA B shape mismatch for adapter {adapter_id!r}, module {module_name!r}")
-            if rank is None:
-                rank = weights.rank
-                scale = weights.scale
-            elif rank != weights.rank or scale != weights.scale:
-                raise ValueError("Per-module rank/alpha patterns are not supported in the first runtime")
 
-            self.A[module_name][slot].zero_()
-            self.B[module_name][slot].zero_()
             self.A[module_name][slot, :, : weights.rank].copy_(
                 weights.A.to(device=self.device, dtype=self.dtype), non_blocking=True
             )
             self.B[module_name][slot, : weights.rank, :].copy_(
                 weights.B.to(device=self.device, dtype=self.dtype), non_blocking=True
             )
+            self.ranks[module_name][slot] = int(weights.rank)
+            self.scales[module_name][slot] = float(weights.scale)
 
-        self.ranks[slot] = int(rank or 0)
-        self.scales[slot] = float(scale or 0.0)
         self.adapter_to_slot[adapter_id] = slot
         self.slot_to_adapter[slot] = adapter_id
         self._touch(adapter_id)

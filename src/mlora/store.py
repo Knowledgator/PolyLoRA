@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections import OrderedDict
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,128 @@ class CpuAdapter:
     layers: dict[str, CpuLayerWeights]
 
 
+@dataclass(frozen=True)
+class DiskAdapterEntry:
+    adapter_id: str
+    path: Path
+    peft_adapter_name: str
+
+
+class DiskAdapterCache:
+    _MANIFEST_NAME = "manifest.json"
+
+    def __init__(self, cache_dir: str | Path, max_adapters: int | None = None) -> None:
+        if max_adapters is not None and max_adapters < 1:
+            raise ValueError("max_adapters must be at least 1")
+        self.cache_dir = Path(cache_dir)
+        self.max_adapters = max_adapters
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.entries: OrderedDict[str, DiskAdapterEntry] = OrderedDict()
+        self._load_manifest()
+        self._evict_if_needed()
+
+    def __contains__(self, adapter_id: str) -> bool:
+        return adapter_id in self.entries
+
+    def get(self, adapter_id: str) -> DiskAdapterEntry:
+        try:
+            entry = self.entries[adapter_id]
+        except KeyError as exc:
+            raise KeyError(f"Unknown disk LoRA adapter id: {adapter_id}") from exc
+        self.touch(adapter_id)
+        return entry
+
+    def touch(self, adapter_id: str) -> None:
+        if adapter_id in self.entries:
+            self.entries.move_to_end(adapter_id)
+            self._write_manifest()
+
+    def add_adapter(
+        self,
+        adapter_id: str,
+        adapter_path: str | Path,
+        peft_adapter_name: str = "default",
+    ) -> Path:
+        adapter_path = Path(adapter_path)
+        self._validate_adapter_dir(adapter_path)
+        target_path = self.cache_dir / self._entry_dirname(adapter_id)
+        if adapter_path.resolve() != target_path.resolve():
+            if target_path.exists():
+                shutil.rmtree(target_path)
+            shutil.copytree(adapter_path, target_path)
+        self.entries[adapter_id] = DiskAdapterEntry(adapter_id, target_path, peft_adapter_name)
+        self.entries.move_to_end(adapter_id)
+        self._evict_if_needed(exclude={adapter_id})
+        self._write_manifest()
+        return target_path
+
+    def _load_manifest(self) -> None:
+        manifest_path = self.cache_dir / self._MANIFEST_NAME
+        if not manifest_path.exists():
+            return
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        for item in data.get("adapters", []):
+            adapter_id = str(item["adapter_id"])
+            path = self.cache_dir / str(item["path"])
+            if not path.exists():
+                continue
+            self.entries[adapter_id] = DiskAdapterEntry(
+                adapter_id=adapter_id,
+                path=path,
+                peft_adapter_name=str(item.get("peft_adapter_name", "default")),
+            )
+
+    def _write_manifest(self) -> None:
+        manifest_path = self.cache_dir / self._MANIFEST_NAME
+        data = {
+            "adapters": [
+                {
+                    "adapter_id": entry.adapter_id,
+                    "path": entry.path.name,
+                    "peft_adapter_name": entry.peft_adapter_name,
+                }
+                for entry in self.entries.values()
+            ]
+        }
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+
+    def _evict_if_needed(self, exclude: set[str] | None = None) -> None:
+        if self.max_adapters is None:
+            return
+        exclude = exclude or set()
+        changed = False
+        while len(self.entries) > self.max_adapters:
+            for adapter_id, entry in list(self.entries.items()):
+                if adapter_id in exclude:
+                    continue
+                self.entries.pop(adapter_id)
+                if entry.path.exists():
+                    shutil.rmtree(entry.path)
+                changed = True
+                break
+            else:
+                raise RuntimeError("No evictable disk LoRA adapter is available")
+        if changed:
+            self._write_manifest()
+
+    @staticmethod
+    def _entry_dirname(adapter_id: str) -> str:
+        safe = "".join(char if char.isalnum() or char in ("-", "_", ".") else "_" for char in adapter_id)
+        digest = sha256(adapter_id.encode("utf-8")).hexdigest()[:12]
+        return f"{safe or 'adapter'}-{digest}"
+
+    @staticmethod
+    def _validate_adapter_dir(adapter_path: Path) -> None:
+        if not (adapter_path / "adapter_config.json").exists():
+            raise FileNotFoundError(f"PEFT adapter config not found: {adapter_path / 'adapter_config.json'}")
+        has_safetensors = (adapter_path / "adapter_model.safetensors").exists()
+        has_bin = (adapter_path / "adapter_model.bin").exists()
+        if not has_safetensors and not has_bin:
+            raise FileNotFoundError(f"No PEFT adapter weights found in {adapter_path}")
+
+
 def _pin_if_possible(tensor: torch.Tensor) -> torch.Tensor:
     if torch.cuda.is_available():
         try:
@@ -34,22 +158,39 @@ def _pin_if_possible(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class CpuAdapterStore:
-    def __init__(self, base_adapter_id: str = "__base__", max_adapters: int | None = None) -> None:
+    def __init__(
+        self,
+        base_adapter_id: str = "__base__",
+        max_adapters: int | None = None,
+        disk_cache: DiskAdapterCache | None = None,
+        module_names: list[str] | None = None,
+    ) -> None:
         if max_adapters is not None and max_adapters < 1:
             raise ValueError("max_adapters must be at least 1")
         self.base_adapter_id = base_adapter_id
         self.max_adapters = max_adapters
+        self.disk_cache = disk_cache
+        self.module_names = module_names
         self.adapters: OrderedDict[str, CpuAdapter] = OrderedDict()
         self.eviction_exclusions: set[str] = set()
 
     def __contains__(self, adapter_id: str) -> bool:
-        return adapter_id == self.base_adapter_id or adapter_id in self.adapters
+        return (
+            adapter_id == self.base_adapter_id
+            or adapter_id in self.adapters
+            or (self.disk_cache is not None and adapter_id in self.disk_cache)
+        )
 
     def get(self, adapter_id: str) -> CpuAdapter:
+        if adapter_id == self.base_adapter_id:
+            raise KeyError(f"Base adapter {adapter_id!r} has no LoRA weights")
         try:
             adapter = self.adapters[adapter_id]
         except KeyError as exc:
-            raise KeyError(f"Unknown LoRA adapter id: {adapter_id}") from exc
+            if self.disk_cache is None or adapter_id not in self.disk_cache:
+                raise KeyError(f"Unknown LoRA adapter id: {adapter_id}") from exc
+            self._load_adapter_from_disk_cache(adapter_id)
+            adapter = self.adapters[adapter_id]
         self.touch(adapter_id)
         return adapter
 
@@ -59,6 +200,9 @@ class CpuAdapterStore:
 
     def set_eviction_exclusions(self, adapter_ids: set[str]) -> None:
         self.eviction_exclusions = {adapter_id for adapter_id in adapter_ids if adapter_id != self.base_adapter_id}
+
+    def set_module_names(self, module_names: list[str]) -> None:
+        self.module_names = list(module_names)
 
     def add_adapter(
         self,
@@ -83,12 +227,15 @@ class CpuAdapterStore:
         peft_adapter_name: str = "default",
         config: dict[str, Any] | None = None,
     ) -> None:
+        self._validate_lora_keys_within_modules(adapter_id, state_dict, module_names)
         layers: dict[str, CpuLayerWeights] = {}
         for module_name in module_names:
             lora_a_key = self._find_lora_key(state_dict, module_name, "lora_A", peft_adapter_name)
             lora_b_key = self._find_lora_key(state_dict, module_name, "lora_B", peft_adapter_name)
             if lora_a_key is None or lora_b_key is None:
-                raise ValueError(f"Adapter {adapter_id!r} is missing LoRA weights for {module_name!r}")
+                if lora_a_key is None and lora_b_key is None:
+                    continue
+                raise ValueError(f"Adapter {adapter_id!r} has incomplete LoRA weights for {module_name!r}")
 
             lora_a = state_dict[lora_a_key].detach().to("cpu").contiguous()
             lora_b = state_dict[lora_b_key].detach().to("cpu").contiguous()
@@ -137,6 +284,30 @@ class CpuAdapterStore:
         module_names: list[str],
         peft_adapter_name: str = "default",
     ) -> None:
+        if self.disk_cache is not None:
+            adapter_path = self.disk_cache.add_adapter(adapter_id, adapter_path, peft_adapter_name)
+        self._load_adapter_from_disk_path(adapter_id, adapter_path, module_names, peft_adapter_name)
+
+    def _load_adapter_from_disk_cache(self, adapter_id: str) -> None:
+        if self.disk_cache is None:
+            raise KeyError(f"Unknown LoRA adapter id: {adapter_id}")
+        if self.module_names is None:
+            raise RuntimeError("module_names must be configured before loading adapters from disk cache")
+        entry = self.disk_cache.get(adapter_id)
+        self._load_adapter_from_disk_path(
+            adapter_id=adapter_id,
+            adapter_path=entry.path,
+            module_names=self.module_names,
+            peft_adapter_name=entry.peft_adapter_name,
+        )
+
+    def _load_adapter_from_disk_path(
+        self,
+        adapter_id: str,
+        adapter_path: str | Path,
+        module_names: list[str],
+        peft_adapter_name: str = "default",
+    ) -> None:
         adapter_path = Path(adapter_path)
         config_path = adapter_path / "adapter_config.json"
         if not config_path.exists():
@@ -169,6 +340,37 @@ class CpuAdapterStore:
             if key.endswith(suffix) or key.endswith(suffix_without_adapter):
                 return key
         return None
+
+    @classmethod
+    def _validate_lora_keys_within_modules(
+        cls,
+        adapter_id: str,
+        state_dict: dict[str, torch.Tensor],
+        module_names: list[str],
+    ) -> None:
+        unexpected = sorted(
+            module_name
+            for module_name in cls._state_dict_lora_module_names(state_dict)
+            if not cls._matches_module_name(module_name, module_names)
+        )
+        if unexpected:
+            raise ValueError(
+                f"Adapter {adapter_id!r} contains LoRA weights outside the configured module set: {unexpected}"
+            )
+
+    @staticmethod
+    def _state_dict_lora_module_names(state_dict: dict[str, torch.Tensor]) -> set[str]:
+        module_names: set[str] = set()
+        for key in state_dict:
+            for marker in (".lora_A.", ".lora_B.", ".lora_A.weight", ".lora_B.weight"):
+                if marker in key:
+                    module_names.add(key.split(marker, 1)[0])
+                    break
+        return module_names
+
+    @staticmethod
+    def _matches_module_name(module_name: str, allowed_module_names: list[str]) -> bool:
+        return any(module_name == allowed or module_name.endswith(f".{allowed}") for allowed in allowed_module_names)
 
     @staticmethod
     def _load_peft_state_dict(adapter_path: Path) -> dict[str, torch.Tensor]:

@@ -9,7 +9,7 @@ from .cache import GpuAdapterCache, ModuleSpec
 from .config import CustomLoraConfig
 from .context import LoraBatchContext, assert_right_padded, use_lora_context
 from .layers import MultiLoraLinear
-from .store import CpuAdapterStore
+from .store import CpuAdapterStore, DiskAdapterCache
 
 
 class CustomPeftModel(nn.Module):
@@ -22,14 +22,25 @@ class CustomPeftModel(nn.Module):
         super().__init__()
         self.base_model = base_model
         self.config = config
-        self.adapter_store = adapter_store or CpuAdapterStore(config.base_adapter_id, config.max_cpu_adapters)
         self.module_specs = self._collect_module_specs(base_model, config.target_modules)
         if not self.module_specs:
-            raise ValueError("No nn.Linear modules matched target_modules")
+            raise ValueError("No nn.Linear modules matched the mLoRA module selection")
+        disk_cache = (
+            DiskAdapterCache(config.disk_cache_dir, config.max_disk_adapters)
+            if config.disk_cache_dir is not None
+            else None
+        )
+        self.adapter_store = adapter_store or CpuAdapterStore(
+            config.base_adapter_id,
+            config.max_cpu_adapters,
+            disk_cache=disk_cache,
+            module_names=self.target_module_names,
+        )
+        self.adapter_store.set_module_names(self.target_module_names)
 
         device, dtype = self._infer_device_dtype(base_model)
         self.adapter_cache = GpuAdapterCache(self.adapter_store, self.module_specs, config, device, dtype)
-        self._replace_target_modules(self.base_model, config.target_modules)
+        self._replace_target_modules(self.base_model)
 
     @property
     def target_module_names(self) -> list[str]:
@@ -104,14 +115,14 @@ class CustomPeftModel(nn.Module):
         return any(name == target or name.endswith(f".{target}") for target in target_modules)
 
     @classmethod
-    def _collect_module_specs(cls, model: nn.Module, target_modules: list[str]) -> list[ModuleSpec]:
+    def _collect_module_specs(cls, model: nn.Module, target_modules: list[str] | None) -> list[ModuleSpec]:
         specs: list[ModuleSpec] = []
         for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and cls._matches_target(name, target_modules):
+            if isinstance(module, nn.Linear) and (target_modules is None or cls._matches_target(name, target_modules)):
                 specs.append(ModuleSpec(name, module.in_features, module.out_features))
         return specs
 
-    def _replace_target_modules(self, model: nn.Module, target_modules: list[str]) -> None:
+    def _replace_target_modules(self, model: nn.Module) -> None:
         for module_name in self.target_module_names:
             parent, child_name = self._get_parent(model, module_name)
             child = getattr(parent, child_name)
