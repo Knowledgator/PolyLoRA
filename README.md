@@ -1,79 +1,78 @@
-# mlora
+# PolyLoRA
 
-`mlora` is a small PyTorch runtime for serving batches where each row can use a different LoRA adapter. It wraps an existing `torch.nn.Module`, replaces selected `nn.Linear` layers with multi-adapter LoRA layers, and keeps adapter weights in a CPU store with a bounded GPU cache.
+Minimal PyTorch runtime for batched LoRA inference where each row can use a different adapter.
 
-The package can load PEFT LoRA adapters from an in-memory PEFT model or from PEFT adapter directories on disk.
+PolyLoRA wraps an existing `torch.nn.Module`, replaces selected `nn.Linear` layers, and serves PEFT LoRA adapters from CPU, GPU, and optional disk caches.
 
-## Installation
-
-From this repository:
+## Install
 
 ```bash
-pip install ./mlora
+pip install .
 ```
 
-For PEFT adapter loading examples and tests:
+With PEFT loading support:
 
 ```bash
-pip install './mlora[peft]'
+pip install '.[peft]'
 ```
 
-## Quick start
+## Usage
 
 ```python
-import torch
-from transformers import AutoModel, AutoTokenizer
-
-from mlora import CustomLoraConfig, CustomPeftModel
-
-base_model = AutoModel.from_pretrained("microsoft/deberta-v3-base").eval().to("cuda")
-tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-base")
+from polylora import CustomLoraConfig, CustomPeftModel
 
 model = CustomPeftModel(
     base_model,
     CustomLoraConfig(
-        target_modules=["query_proj", "key_proj", "value_proj", "dense"],
         max_gpu_adapters=4,
         max_rank=16,
+        target_modules=["query_proj", "key_proj", "value_proj", "dense"],
     ),
 ).eval()
 
 model.load_adapter_from_disk("legal", "./adapters/legal")
 model.load_adapter_from_disk("finance", "./adapters/finance")
 
-batch = tokenizer(
-    ["contract text", "earnings report"],
-    padding=True,
-    return_tensors="pt",
-).to("cuda")
-
-with torch.inference_mode():
-    outputs = model(**batch, adapter_ids=["legal", "finance"])
+outputs = model(**batch, adapter_ids=["legal", "finance"])
 ```
 
-Use `adapter_ids=None` or omit `adapter_ids` to run the base model without LoRA. Use the configured base adapter id, `__base__` by default, for rows that should skip LoRA inside a mixed batch.
+Omit `adapter_ids` to run the base model. Use `__base__` for rows that should skip LoRA inside a mixed batch.
 
-## API
+## Caches
 
-- `CustomLoraConfig`: runtime configuration for target modules, cache sizes, maximum rank, padding checks, and Triton kernel usage.
-- `CustomPeftModel`: wraps a base model and handles per-row adapter dispatch.
-- `CpuAdapterStore`: CPU-side adapter storage with optional eviction.
-- `GpuAdapterCache`: GPU-side adapter cache used by `CustomPeftModel`.
-- `MultiLoraLinear`: replacement linear layer that applies the active row-level LoRA context.
-- `LoraBatchContext`: explicit context object for lower-level integrations.
+PolyLoRA uses three adapter tiers:
 
-## Adapter requirements
+- GPU cache: fixed-size adapter slots for the active batch. Slot `0` is reserved for `__base__`, so non-adapter rows share the same execution path.
+- CPU cache: LRU store for loaded adapter weights. GPU evictions can reload from CPU without touching disk.
+- Disk cache: optional bounded PEFT adapter directory cache. CPU misses can reload adapters from this cold layer.
 
-`mlora` supports standard PEFT LoRA adapters for inference. The current runtime does not support LoRA dropout, DoRA, RS-LoRA, or LoRA bias. Attention masks must be right padded when `enforce_right_padding=True`.
+This makes small hot sets fast while still allowing a larger adapter catalog than GPU memory can hold.
 
-Triton kernels are used on CUDA when available. The implementation falls back to a PyTorch reference path on CPU or when `use_triton_kernels=False`.
+## Kernels
+
+On CUDA, PolyLoRA uses Triton SGMV kernels for the LoRA `A` and `B` projections:
+
+- Mixed batches can contain different adapter ids, including `__base__` rows.
+- Different adapters may use different ranks, up to `max_rank`.
+- Rank-0 rows skip adapter work, which is how base-only rows and missing layer weights are represented.
+- The `B` projection fuses scaling and add-back into the base linear output.
+- The implementation falls back to a PyTorch reference path on CPU or when Triton is disabled.
+
+## Adapter Layouts
+
+Adapters do not need to cover every wrapped layer. If a model is wrapped with a larger `target_modules` set and an adapter only contains LoRA weights for some of those layers, missing layers are treated as rank-0 no-ops for that adapter.
+
+PolyLoRA rejects adapters with weights outside the configured module set, which keeps mixed adapters predictable when different adapters target different subsets of the model.
+
+## Notes
+
+- Supports standard PEFT LoRA adapters for inference.
+- Does not support LoRA dropout, DoRA, RS-LoRA, or LoRA bias.
+- Attention masks must be right padded when `enforce_right_padding=True`.
 
 ## Development
 
-Run the package tests from this repository root:
-
 ```bash
-pytest mlora/tests
+pip install -e '.[dev]'
+pytest tests
 ```
-
-The tests use the local `peft/` checkout when present.

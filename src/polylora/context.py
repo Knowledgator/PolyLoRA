@@ -17,7 +17,7 @@ class LoraBatchContext:
 
 
 _CURRENT_LORA_CONTEXT: ContextVar[LoraBatchContext | None] = ContextVar(
-    "mlora_current_lora_context", default=None
+    "polylora_current_lora_context", default=None
 )
 
 

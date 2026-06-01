@@ -24,7 +24,7 @@ class CustomPeftModel(nn.Module):
         self.config = config
         self.module_specs = self._collect_module_specs(base_model, config.target_modules)
         if not self.module_specs:
-            raise ValueError("No nn.Linear modules matched the mLoRA module selection")
+            raise ValueError("No nn.Linear modules matched the PolyLoRA module selection")
         disk_cache = (
             DiskAdapterCache(config.disk_cache_dir, config.max_disk_adapters)
             if config.disk_cache_dir is not None
