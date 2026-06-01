@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
-class CustomLoraConfig:
+class PolyLoraConfig:
     max_gpu_adapters: int
     max_rank: int
     target_modules: list[str] | None = None
@@ -27,3 +27,6 @@ class CustomLoraConfig:
             raise ValueError("max_rank must be at least 1")
         if self.target_modules is not None and not self.target_modules:
             raise ValueError("target_modules must not be empty when provided")
+
+
+CustomLoraConfig = PolyLoraConfig

@@ -6,17 +6,17 @@ import torch
 from torch import nn
 
 from .cache import GpuAdapterCache, ModuleSpec
-from .config import CustomLoraConfig
+from .config import PolyLoraConfig
 from .context import LoraBatchContext, assert_right_padded, use_lora_context
 from .layers import MultiLoraLinear
 from .store import CpuAdapterStore, DiskAdapterCache
 
 
-class CustomPeftModel(nn.Module):
+class PolyLoraModel(nn.Module):
     def __init__(
         self,
         base_model: nn.Module,
-        config: CustomLoraConfig,
+        config: PolyLoraConfig,
         adapter_store: CpuAdapterStore | None = None,
     ) -> None:
         super().__init__()
@@ -161,3 +161,6 @@ class CustomPeftModel(nn.Module):
         batch_size, seq_len = int(tensor.shape[0]), int(tensor.shape[1])
         dtype = tensor.dtype if tensor.is_floating_point() else torch.float32
         return batch_size, seq_len, tensor.device, dtype
+
+
+CustomPeftModel = PolyLoraModel

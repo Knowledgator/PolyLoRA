@@ -19,11 +19,11 @@ pip install '.[peft]'
 ## Usage
 
 ```python
-from polylora import CustomLoraConfig, CustomPeftModel
+from polylora import PolyLoraConfig, PolyLoraModel
 
-model = CustomPeftModel(
+model = PolyLoraModel(
     base_model,
-    CustomLoraConfig(
+    PolyLoraConfig(
         max_gpu_adapters=4,
         max_rank=16,
         target_modules=["query_proj", "key_proj", "value_proj", "dense"],

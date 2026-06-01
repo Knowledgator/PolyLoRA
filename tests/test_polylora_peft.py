@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 import torch
 from transformers import DebertaV2Config, DebertaV2Model
 
-from polylora import CustomLoraConfig, CustomPeftModel
+from polylora import PolyLoraConfig, PolyLoraModel
 
 
 def _import_local_peft():
@@ -72,9 +72,9 @@ def test_polylora_mixed_deberta_matches_peft_multiple_adapters(tmp_path):
     peft_model.add_adapter("b", lora_b_config)
     peft_model.eval()
 
-    polylora_model = CustomPeftModel(
+    polylora_model = PolyLoraModel(
         copy.deepcopy(base_model),
-        CustomLoraConfig(
+        PolyLoraConfig(
             target_modules=["query_proj", "key_proj", "value_proj", "dense"],
             max_gpu_adapters=2,
             max_rank=3,
@@ -195,9 +195,9 @@ def test_polylora_loads_three_peft_adapters_from_disk_and_batches_predictions(tm
             peft_outputs.append(peft_model(**single_sample).last_hidden_state)
         expected = torch.cat(peft_outputs, dim=0)
 
-    polylora_model = CustomPeftModel(
+    polylora_model = PolyLoraModel(
         copy.deepcopy(base_model),
-        CustomLoraConfig(
+        PolyLoraConfig(
             target_modules=target_modules,
             max_gpu_adapters=3,
             max_rank=4,
@@ -241,9 +241,9 @@ def test_polylora_gpu_cache_reloads_from_cpu_cache():
     peft_model = get_peft_model(copy.deepcopy(base_model), lora_config, adapter_name="a").eval()
     peft_model.add_adapter("b", lora_config)
 
-    polylora_model = CustomPeftModel(
+    polylora_model = PolyLoraModel(
         copy.deepcopy(base_model),
-        CustomLoraConfig(
+        PolyLoraConfig(
             target_modules=["query_proj", "key_proj", "value_proj", "dense"],
             max_gpu_adapters=1,
             max_cpu_adapters=2,
@@ -300,9 +300,9 @@ def test_polylora_base_adapter_uses_slot_zero_rank_zero():
     )
     peft_model = get_peft_model(copy.deepcopy(base_model), lora_config, adapter_name="a").eval()
 
-    polylora_model = CustomPeftModel(
+    polylora_model = PolyLoraModel(
         copy.deepcopy(base_model),
-        CustomLoraConfig(
+        PolyLoraConfig(
             target_modules=["query_proj", "key_proj", "value_proj", "dense"],
             max_gpu_adapters=1,
             max_rank=2,
@@ -355,9 +355,9 @@ def test_polylora_missing_layer_weights_are_rank_zero_and_match_sparse_peft():
     )
     peft_model = get_peft_model(copy.deepcopy(base_model), sparse_config, adapter_name="sparse").eval()
 
-    polylora_model = CustomPeftModel(
+    polylora_model = PolyLoraModel(
         copy.deepcopy(base_model),
-        CustomLoraConfig(
+        PolyLoraConfig(
             max_gpu_adapters=1,
             max_rank=2,
             use_triton_kernels=False,
@@ -413,9 +413,9 @@ def test_polylora_rejects_adapter_weights_outside_configured_module_set():
         adapter_name="a",
     ).eval()
 
-    polylora_model = CustomPeftModel(
+    polylora_model = PolyLoraModel(
         copy.deepcopy(base_model),
-        CustomLoraConfig(
+        PolyLoraConfig(
             max_gpu_adapters=1,
             max_rank=2,
             target_modules=["value_proj"],
@@ -461,9 +461,9 @@ def test_polylora_rejects_incomplete_layer_weight_pair():
         if ".lora_B." in key:
             state_dict.pop(key)
 
-    polylora_model = CustomPeftModel(
+    polylora_model = PolyLoraModel(
         copy.deepcopy(base_model),
-        CustomLoraConfig(
+        PolyLoraConfig(
             max_gpu_adapters=1,
             max_rank=2,
             target_modules=["value_proj"],
@@ -518,9 +518,9 @@ def test_polylora_cpu_miss_reloads_adapter_from_disk_cache(tmp_path):
         peft_model.save_pretrained(str(adapter_path), safe_serialization=False)
         adapter_paths[adapter_id] = adapter_path
 
-    polylora_model = CustomPeftModel(
+    polylora_model = PolyLoraModel(
         copy.deepcopy(base_model),
-        CustomLoraConfig(
+        PolyLoraConfig(
             target_modules=target_modules,
             max_gpu_adapters=1,
             max_cpu_adapters=1,
@@ -570,9 +570,9 @@ def test_polylora_disk_cache_evicts_oldest_adapter_directory(tmp_path):
     target_modules = ["query_proj", "key_proj", "value_proj", "dense"]
     cache_dir = tmp_path / "disk_cache"
 
-    polylora_model = CustomPeftModel(
+    polylora_model = PolyLoraModel(
         copy.deepcopy(base_model),
-        CustomLoraConfig(
+        PolyLoraConfig(
             target_modules=target_modules,
             max_gpu_adapters=1,
             max_cpu_adapters=1,

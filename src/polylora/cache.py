@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .config import CustomLoraConfig
+from .config import PolyLoraConfig
 from .store import CpuAdapterStore
 
 
@@ -21,7 +21,7 @@ class GpuAdapterCache:
         self,
         store: CpuAdapterStore,
         module_specs: list[ModuleSpec],
-        config: CustomLoraConfig,
+        config: PolyLoraConfig,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
