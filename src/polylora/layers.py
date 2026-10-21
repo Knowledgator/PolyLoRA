@@ -78,6 +78,34 @@ class MultiLoraLinear(nn.Module):
             return False  # flattened padded batch; equals the packed layout when there is no padding
         return x.shape[0] == lora_ctx.num_tokens
 
+    def project_shared(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Project an input shared by every row, once per distinct adapter in the batch.
+
+        ``x`` is (1, ..., in_features), e.g. DeBERTa's relative position embeddings. Returns
+        ``(out, index)``: ``out`` is (S, ..., out_features), the projection under each of the S
+        distinct adapters of the batch, and ``index`` (B,) picks each row's entry, or is None when
+        every row uses the same adapter (S == 1).
+        """
+        if x.shape[0] != 1:
+            raise ValueError(f"project_shared expects a (1, ..., features) input, got {tuple(x.shape)}")
+        base = self.base_layer(x)
+        lora_ctx = get_lora_context()
+        if lora_ctx is None:
+            return base, None
+        slots, index = lora_ctx.adapter_groups(self.cache.adapter_to_slot)
+        if slots == [0]:
+            return base, None  # every row is __base__
+
+        slot_ids = torch.tensor(slots, dtype=torch.long, device=x.device)
+        A = self.cache.A[self.module_name].index_select(0, slot_ids)         # (S, in, max_rank)
+        B = self.cache.B[self.module_name].index_select(0, slot_ids)         # (S, max_rank, out)
+        scales = self.cache.scales[self.module_name].index_select(0, slot_ids)
+        # Unused rank columns of A / rows of B are zero, so the full max_rank needs no rank lookup.
+        rows = x.reshape(-1, x.shape[-1])                                     # (M, in)
+        delta = torch.matmul(torch.matmul(rows, A), B) * scales.to(base.dtype)[:, None, None]
+        out = base.reshape(1, -1, base.shape[-1]) + delta                     # (S, M, out)
+        return out.reshape(len(slots), *base.shape[1:]), index
+
     def _can_use_triton(self, x: torch.Tensor) -> bool:
         return (
             self.cache.config.use_triton_kernels
@@ -110,10 +138,18 @@ class MultiLoraLinear(nn.Module):
             return self._flat(x), self._flat(base), seq_lens, seg_starts, weight_indices, width
 
         if x.dim() == 3 and x.shape[0] == 1:
-            # (1, M, features) shared by every row (e.g. relative position embeddings): row 0's adapter.
+            # (1, M, features) shared by every row, e.g. relative position embeddings. One output can
+            # only carry one adapter; models that need one per row call `project_shared` instead.
+            slots, _ = lora_ctx.adapter_groups(self.cache.adapter_to_slot)
+            if len(slots) > 1:
+                raise ValueError(
+                    f"{self.module_name}: input of shape {tuple(x.shape)} is shared by rows with different "
+                    "adapters; the model must call MultiLoraLinear.project_shared to get one output per adapter"
+                )
             width = x.shape[1]
-            seq_lens, seg_starts = lora_ctx.padded_segments(width)
-            return self._flat(x), self._flat(base), seq_lens[:1], seg_starts[:1], weight_indices[:1], width
+            seq_lens = torch.full((1,), width, dtype=torch.int32, device=x.device)
+            seg_starts = torch.zeros(1, dtype=torch.int32, device=x.device)
+            return self._flat(x), self._flat(base), seq_lens, seg_starts, weight_indices[:1], width
 
         if x.dim() == 2 and lora_ctx.max_seq_len is not None and x.shape[0] == batch_size * lora_ctx.max_seq_len:
             # Flattened padded batch (B * L, features). Packed inputs are handled before this.

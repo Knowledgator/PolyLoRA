@@ -20,20 +20,45 @@ class LoraBatchContext:
     # First row of each batch in a packed (T, ...) layer input: the real tokens of every
     # row laid end to end in row order, as produced by unpadding with the attention mask.
     seg_starts: torch.Tensor | None = None
-    _padded_cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
+    # Per-forward memo shared by every layer (padded segments, adapter groups).
+    _cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def padded_segments(self, width: int) -> tuple[torch.Tensor, torch.Tensor]:
         """(seq_lens, seg_starts) of a (B, width, ...) layer input viewed as (B * width, ...).
 
-        Row lengths are capped at ``width``, so a one-vector-per-row input (width 1) only
-        touches its own row. Cached per width: every layer of a forward pass reuses them.
+        Only a token-aligned input (``width`` equal to the padded length) skips padding; any other
+        per-row input, e.g. one pooled vector (width 1) or span features, gets LoRA on all ``width``
+        entries, as PEFT does. Cached per width: every layer of a forward pass reuses them.
         """
-        cached = self._padded_cache.get(width)
+        key = ("padded", width)
+        cached = self._cache.get(key)
         if cached is None:
             batch_size = self.seq_lens.shape[0]
-            seq_lens = torch.clamp(self.seq_lens, max=width).to(torch.int32)
+            if self.max_seq_len is None or width == self.max_seq_len:
+                seq_lens = torch.clamp(self.seq_lens, max=width).to(torch.int32)
+            else:
+                seq_lens = torch.full_like(self.seq_lens, width, dtype=torch.int32)
             seg_starts = torch.arange(batch_size, device=self.seq_lens.device, dtype=torch.int32) * width
-            cached = self._padded_cache[width] = (seq_lens, seg_starts)
+            cached = self._cache[key] = (seq_lens, seg_starts)
+        return cached
+
+    def adapter_groups(self, adapter_to_slot: dict[str, int]) -> tuple[list[int], torch.Tensor | None]:
+        """Distinct adapter slots of the batch and each row's position among them.
+
+        Returns ``(slots, index)``: ``slots`` lists each distinct slot once in first-use order and
+        ``index`` (B,) maps every row to its entry, or is None when all rows share one adapter.
+        Built from host-side ids, so it needs no GPU sync.
+        """
+        cached = self._cache.get("groups")
+        if cached is None:
+            row_slots = [adapter_to_slot.get(adapter_id, 0) for adapter_id in self.adapter_ids]
+            slots = list(dict.fromkeys(row_slots))
+            index = None
+            if len(slots) > 1:
+                position = {slot: i for i, slot in enumerate(slots)}
+                index = torch.tensor([position[slot] for slot in row_slots], dtype=torch.long,
+                                     device=self.weight_indices.device)
+            cached = self._cache["groups"] = (slots, index)
         return cached
 
     @cached_property
