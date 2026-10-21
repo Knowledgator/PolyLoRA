@@ -103,11 +103,15 @@ class PolyLoraModel(nn.Module):
             if self.config.enforce_right_padding:
                 assert_right_padded(attention_mask.to(device), seq_lens)
 
+        seq_lens = seq_lens.to(torch.int32)
+        seg_starts = torch.cumsum(seq_lens, dim=0, dtype=torch.int32) - seq_lens
         return LoraBatchContext(
             adapter_ids=list(adapter_ids),
             weight_indices=weight_indices,
             seq_lens=seq_lens,
             attention_mask=attention_mask,
+            max_seq_len=seq_len,
+            seg_starts=seg_starts,
         )
 
     @staticmethod

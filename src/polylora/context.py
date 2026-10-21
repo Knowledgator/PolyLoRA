@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Iterator
 
 import torch
@@ -14,6 +15,31 @@ class LoraBatchContext:
     weight_indices: torch.Tensor
     seq_lens: torch.Tensor
     attention_mask: torch.Tensor | None = None
+    # Padded sequence length of the batch; bounds every row's length.
+    max_seq_len: int | None = None
+    # First row of each batch in a packed (T, ...) layer input: the real tokens of every
+    # row laid end to end in row order, as produced by unpadding with the attention mask.
+    seg_starts: torch.Tensor | None = None
+    _padded_cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    def padded_segments(self, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """(seq_lens, seg_starts) of a (B, width, ...) layer input viewed as (B * width, ...).
+
+        Row lengths are capped at ``width``, so a one-vector-per-row input (width 1) only
+        touches its own row. Cached per width: every layer of a forward pass reuses them.
+        """
+        cached = self._padded_cache.get(width)
+        if cached is None:
+            batch_size = self.seq_lens.shape[0]
+            seq_lens = torch.clamp(self.seq_lens, max=width).to(torch.int32)
+            seg_starts = torch.arange(batch_size, device=self.seq_lens.device, dtype=torch.int32) * width
+            cached = self._padded_cache[width] = (seq_lens, seg_starts)
+        return cached
+
+    @cached_property
+    def num_tokens(self) -> int:
+        """Real tokens in the batch (T of a packed input). Reads one value back from the GPU, once."""
+        return int(self.seq_lens.sum())
 
 
 _CURRENT_LORA_CONTEXT: ContextVar[LoraBatchContext | None] = ContextVar(
