@@ -18,6 +18,11 @@ LoRA-A uses a direct `(tile, segment)` grid to avoid per-program prefix-search
 scheduling overhead on its small rank/output tiles. LoRA-B keeps the compact
 flat schedule because its wide output axis makes wasted programs more expensive.
 
+Both launches size their grid from tensor shapes only (an upper bound on the real
+tile count; spare programs exit at once), so they never read from the GPU. Both are
+registered as custom ops (``polylora::sgmv_lora_a``, ``polylora::sgmv_lora_b_``),
+so they work under ``torch.compile`` and inside CUDA graphs.
+
 Rank-variation axis:
     LoRA-A: rank lives on the OUTPUT axis (N).  Per-segment N is clamped to
             rank*stack_num, so smaller-rank segments produce fewer N-tiles.
@@ -42,11 +47,10 @@ def _build_flat_schedule(
     block_n: int,
 ):
     """
-    Returns (cum_tiles, num_n_tiles, total_tiles).
+    Returns (cum_tiles, num_n_tiles), both built on the GPU.
 
     cum_tiles    : (B + 1,) int32, prefix sum of tiles_per_segment
     num_n_tiles  : (B,)     int32, cdiv(n_eff_per_batch, BLOCK_N)
-    total_tiles  : int,            cum_tiles[-1] (host-side via .item())
 
     Segments with seq_len == 0 or n_eff == 0 contribute zero tiles.
     """
@@ -62,9 +66,7 @@ def _build_flat_schedule(
     B = seq_lens.shape[0]
     cum_tiles = torch.zeros(B + 1, dtype=torch.int32, device=device)
     torch.cumsum(tiles_per_batch, dim=0, out=cum_tiles[1:])
-    total_tiles = int(cum_tiles[-1].item())
-
-    return cum_tiles, num_n_tiles.to(torch.int32), total_tiles
+    return cum_tiles, num_n_tiles.to(torch.int32)
 
 
 @triton.jit
@@ -209,6 +211,8 @@ def _sgmv_lora_b_kernel(
     BLOCK_K: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
+    if pid >= tl.load(cum_tiles_ptr + B):
+        return  # the grid is an upper bound on the tile count
 
     lo = 0
     hi = B
@@ -299,11 +303,14 @@ def sgmv_lora_b_fwd(
     ranks_per_batch = lora_ranks[weight_indices]  # (B,)
     n_eff = torch.where(ranks_per_batch > 0, torch.full_like(ranks_per_batch, N), torch.zeros_like(ranks_per_batch))
 
-    cum_tiles, num_n_tiles, total_tiles = _build_flat_schedule(seq_lens, n_eff, BLOCK_M, BLOCK_N)
-    if total_tiles == 0:
+    if B == 0 or T == 0 or N == 0:
         return output
+    cum_tiles, num_n_tiles = _build_flat_schedule(seq_lens, n_eff, BLOCK_M, BLOCK_N)
+    # Segments hold disjoint rows, so sum(cdiv(len, BLOCK_M)) <= cdiv(T, BLOCK_M) + B: a bound known
+    # from shapes alone, so no read of cum_tiles[-1] from the GPU.
+    max_tiles = (triton.cdiv(T, BLOCK_M) + B) * triton.cdiv(N, BLOCK_N)
 
-    _sgmv_lora_b_kernel[(total_tiles,)](
+    _sgmv_lora_b_kernel[(max_tiles,)](
         x, weights, output,
         K_max, N,
         x.stride(0), x.stride(1),
@@ -315,3 +322,33 @@ def sgmv_lora_b_fwd(
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
     )
     return output
+
+
+# ----------------------------------------------------------------------------- custom ops
+
+@torch.library.custom_op("polylora::sgmv_lora_a", mutates_args=())
+def sgmv_lora_a(
+    x: torch.Tensor, weights: torch.Tensor, seq_lens: torch.Tensor, seg_starts: torch.Tensor,
+    weight_indices: torch.Tensor, lora_ranks: torch.Tensor, max_seq_len: int | None = None,
+) -> torch.Tensor:
+    """LoRA-A down-projection of every segment: (T, K) -> (T, max_rank). Rows outside segments are undefined."""
+    return sgmv_lora_a_fwd(x, weights, seq_lens, seg_starts, weight_indices, lora_ranks, max_seq_len=max_seq_len)
+
+
+@sgmv_lora_a.register_fake
+def _(x, weights, seq_lens, seg_starts, weight_indices, lora_ranks, max_seq_len=None):
+    return x.new_empty((x.shape[0], weights.shape[2]))
+
+
+@torch.library.custom_op("polylora::sgmv_lora_b_", mutates_args=("base_output",))
+def sgmv_lora_b_(
+    x: torch.Tensor, weights: torch.Tensor, seq_lens: torch.Tensor, seg_starts: torch.Tensor,
+    weight_indices: torch.Tensor, lora_ranks: torch.Tensor, scalings: torch.Tensor, base_output: torch.Tensor,
+) -> None:
+    """LoRA-B up-projection, scaled and added to ``base_output`` (T, N) in place."""
+    sgmv_lora_b_fwd(x, weights, seq_lens, seg_starts, weight_indices, lora_ranks, scalings, base_output)
+
+
+@sgmv_lora_b_.register_fake
+def _(x, weights, seq_lens, seg_starts, weight_indices, lora_ranks, scalings, base_output):
+    return None

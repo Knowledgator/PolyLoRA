@@ -11,7 +11,8 @@ import torch
 
 @dataclass(frozen=True)
 class LoraBatchContext:
-    adapter_ids: list[str]
+    # One id per row; None when the batch was given as cache slots (``weight_indices``) only.
+    adapter_ids: list[str] | None
     weight_indices: torch.Tensor
     seq_lens: torch.Tensor
     attention_mask: torch.Tensor | None = None
@@ -20,8 +21,25 @@ class LoraBatchContext:
     # First row of each batch in a packed (T, ...) layer input: the real tokens of every
     # row laid end to end in row order, as produced by unpadding with the attention mask.
     seg_starts: torch.Tensor | None = None
+    # The layer inputs are packed by the caller (pre-packed model inputs): every (rows, features)
+    # input that is not one vector per row is packed, possibly with filler rows at the end.
+    packed: bool = False
+    # Do rows use more than one adapter (``__base__`` counts as one)? Found on the host when the batch
+    # is built, so layers can check it under torch.compile; None: unknown (worked out when needed).
+    mixed: bool | None = None
     # Per-forward memo shared by every layer (padded segments, adapter groups).
     _cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    @property
+    def padded_len(self):
+        """Padded sequence length L, read from the mask's shape when there is one.
+
+        Under torch.compile a shape stays symbolic while a stored int would be a constant of the
+        graph, forcing a recompile for every new sequence length.
+        """
+        if self.attention_mask is not None and self.attention_mask.dim() == 2:
+            return self.attention_mask.shape[1]
+        return self.max_seq_len
 
     def padded_segments(self, width: int) -> tuple[torch.Tensor, torch.Tensor]:
         """(seq_lens, seg_starts) of a (B, width, ...) layer input viewed as (B * width, ...).
@@ -31,15 +49,18 @@ class LoraBatchContext:
         entries, as PEFT does. Cached per width: every layer of a forward pass reuses them.
         """
         key = ("padded", width)
-        cached = self._cache.get(key)
+        # Under torch.compile the graph computes these once anyway; a memo would only add guards.
+        cached = None if torch.compiler.is_compiling() else self._cache.get(key)
         if cached is None:
             batch_size = self.seq_lens.shape[0]
-            if self.max_seq_len is None or width == self.max_seq_len:
+            if self.padded_len is None or width == self.padded_len:
                 seq_lens = torch.clamp(self.seq_lens, max=width).to(torch.int32)
             else:
                 seq_lens = torch.full_like(self.seq_lens, width, dtype=torch.int32)
             seg_starts = torch.arange(batch_size, device=self.seq_lens.device, dtype=torch.int32) * width
-            cached = self._cache[key] = (seq_lens, seg_starts)
+            cached = (seq_lens, seg_starts)
+            if not torch.compiler.is_compiling():
+                self._cache[key] = cached
         return cached
 
     def adapter_groups(self, adapter_to_slot: dict[str, int]) -> tuple[list[int], torch.Tensor | None]:
@@ -51,7 +72,10 @@ class LoraBatchContext:
         """
         cached = self._cache.get("groups")
         if cached is None:
-            row_slots = [adapter_to_slot.get(adapter_id, 0) for adapter_id in self.adapter_ids]
+            if self.adapter_ids is None:
+                row_slots = self.weight_indices.tolist()  # eager only: reads the slots back once
+            else:
+                row_slots = [adapter_to_slot.get(adapter_id, 0) for adapter_id in self.adapter_ids]
             slots = list(dict.fromkeys(row_slots))
             index = None
             if len(slots) > 1:

@@ -33,6 +33,8 @@ class GpuAdapterCache:
         self.adapter_to_slot: dict[str, int] = {config.base_adapter_id: 0}
         self.slot_to_adapter: list[str | None] = [config.base_adapter_id] + [None] * config.max_gpu_adapters
         self.lru: OrderedDict[str, None] = OrderedDict()
+        # Batch context of the forward pass in flight, set by PolyLoraModel.forward.
+        self.active_context = None
 
         self.A: dict[str, torch.Tensor] = {}
         self.B: dict[str, torch.Tensor] = {}
@@ -56,6 +58,19 @@ class GpuAdapterCache:
             )
             self.ranks[spec.name] = torch.zeros(self.num_slots, device=self.device, dtype=torch.int32)
             self.scales[spec.name] = torch.zeros(self.num_slots, device=self.device, dtype=torch.float32)
+        self._mark_static()
+
+    def _mark_static(self) -> None:
+        """Tell torch.compile the slot tensors keep their address.
+
+        Adapters are loaded and evicted in place (``copy_``/``zero_``), so a compiled graph and a
+        recorded CUDA graph read the current weights directly: no recompile, no re-capture and no
+        per-call copy of the cache when adapters change.
+        """
+        for tensors in (self.A, self.B, self.ranks, self.scales):
+            for tensor in tensors.values():
+                if tensor.is_cuda:
+                    torch._dynamo.mark_static_address(tensor)
 
     def ensure_resident(self, adapter_ids: list[str]) -> torch.Tensor:
         needed = {adapter_id for adapter_id in adapter_ids if adapter_id != self.config.base_adapter_id}
@@ -93,6 +108,8 @@ class GpuAdapterCache:
         self.B = {name: tensor.to(device=device, dtype=dtype) for name, tensor in self.B.items()}
         self.ranks = {name: tensor.to(device=device) for name, tensor in self.ranks.items()}
         self.scales = {name: tensor.to(device=device) for name, tensor in self.scales.items()}
+        # New tensors: compiled graphs that captured the old ones recompile on their next call.
+        self._mark_static()
 
     def _allocate_or_evict(self, needed: set[str]) -> int:
         for slot in range(1, self.num_slots):
